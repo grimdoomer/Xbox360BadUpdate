@@ -47,6 +47,9 @@
 .ifdef TONY_HAWK_AW
     .include "TonyHawk.asm"
 .endif
+.ifdef RB_BLITZ
+    .include "RBBlitz.asm"
+.endif
 
 # Sanity check the game config.
 .ifndef RuntimeDataSegmentAddress

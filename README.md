@@ -58,5 +58,5 @@ A: The exploit has a 30% success rate. If after running for 20 minutes the explo
 **Q: Why does the exploit only run a single unsigned xex?**  
 A: My goal was to hack the hypervisor, not to develop a robust all-in-one homebrew solution. Someone else will need to develop a post-exploit executable that patches in all the quality of life things you would get from something like the RGH exploit.
 
-**Q: Why does the exploit take so long to trigger/have a lot success rate?**  
+**Q: Why does the exploit take so long to trigger/have a low success rate?**  
 A: The exploit is a race condition that requires precise timing and several other conditions to be met for it to trigger successfully. As such it can take a while for that to happen.

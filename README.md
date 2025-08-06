@@ -28,7 +28,7 @@ To run the Bad Update exploit you'll need one of the supported games listed abov
 8. The console's ring of light will flash different colors/segments during the exploit process to indicate progress. For information on what the different values mean see the [LED Patterns and Meanings](https://github.com/grimdoomer/Xbox360BadUpdate/wiki/How-To-Use#led-patterns-and-meanings) section of the wiki.
 9. Once the exploit triggers successfully the RoL should be fully lit in green. The hypervisor has now been patched to run unsigned executables and your unsigned default.xex file will be run.
 
-The exploit has a 30% success rate and can take up to 20 minutes to trigger successfully. If after 20 minutes the exploit hasn't triggered you'll need to power off your Xbox 360 console and repeat the process from step 5.
+The exploit as of the moment has around an 80% success rate and can take up to 20 minutes to trigger successfully although very likely to finish much earlier. If after 20 minutes the exploit hasn't triggered you'll need to power off your Xbox 360 console and repeat the process from step 5.
 
 # FAQ
 **Q: Why do I have to re-run the exploit every time I turn my console on?**  
@@ -53,10 +53,10 @@ A: No, the Tony Hawk save game exploit is specific to Tony Hawk's American Waste
 A: No, the Rock Band save game exploit is specific to Rock Band Blitz and has nothing to do with it being a music game.
 
 **Q: I ran the exploit and nothing happened?**  
-A: The exploit has a 30% success rate. If after running for 20 minutes the exploit hasn't triggered you'll need to reboot your console and try again.
+A: The exploit has around an 80% success rate which means that there is a chance of failure. If after running for 20 minutes the exploit hasn't triggered you'll need to reboot your console and try again.
 
 **Q: Why does the exploit only run a single unsigned xex?**  
 A: My goal was to hack the hypervisor, not to develop a robust all-in-one homebrew solution. Someone else will need to develop a post-exploit executable that patches in all the quality of life things you would get from something like the RGH exploit.
 
-**Q: Why does the exploit take so long to trigger/have a low success rate?**  
-A: The exploit is a race condition that requires precise timing and several other conditions to be met for it to trigger successfully. As such it can take a while for that to happen.
+~~**Q: Why does the exploit take so long to trigger/have a low success rate?**~~ (No longer the case as of release [v1.2](https://github.com/grimdoomer/Xbox360BadUpdate/releases/tag/v1.2)).  
+~~A: The exploit is a race condition that requires precise timing and several other conditions to be met for it to trigger successfully. As such it can take a while for that to happen.~~

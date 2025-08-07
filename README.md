@@ -28,7 +28,7 @@ To run the Bad Update exploit you'll need one of the supported games listed abov
 8. The console's ring of light will flash different colors/segments during the exploit process to indicate progress. For information on what the different values mean see the [LED Patterns and Meanings](https://github.com/grimdoomer/Xbox360BadUpdate/wiki/How-To-Use#led-patterns-and-meanings) section of the wiki.
 9. Once the exploit triggers successfully the RoL should be fully lit in green. The hypervisor has now been patched to run unsigned executables and your unsigned default.xex file will be run.
 
-The exploit as of the moment has around an 80% success rate and can take up to 20 minutes to trigger successfully although very likely to finish much earlier. If after 20 minutes the exploit hasn't triggered you'll need to power off your Xbox 360 console and repeat the process from step 5.
+At the moment, the exploit has around an 80% success rate and can take up to 15 minutes to trigger successfully, although is very likely to finish much earlier. If after 20 minutes the exploit hasn't triggered you'll need to power off your Xbox 360 console and repeat the process from step 5.
 
 # FAQ
 **Q: Why do I have to re-run the exploit every time I turn my console on?**  
